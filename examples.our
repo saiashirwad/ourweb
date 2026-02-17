@@ -1,0 +1,433 @@
+// ============================================
+// record basics
+// ============================================
+
+type User = { name: String, age: Int, email: String, active: Bool }
+
+let user = { name: "ada", age: 36, email: "ada@example.com", active: true }
+
+// first-class field accessors — .field is a function
+user |> .name                         // => "ada"
+user |> .age                          // => 36
+
+// pick: select a subset of fields
+type Profile = User[.name, .age]      // { name: String, age: Int }
+let profile = user[.name, .age]       // { name: "ada", age: 36 }
+
+// omit: remove fields
+type Public = User - .email           // { name: String, age: Int, active: Bool }
+let public = user - .email            // { name: "ada", age: 36, active: true }
+
+// merge: combine disjoint records
+let full = { name: "ada" } + { age: 36, email: "ada@example.com" }
+
+// override: combine, right side wins on conflicts
+let updated = user | { age: 37, active: false }
+
+// indexed access: get a field's type
+type NameType = User[.name]           // String
+type AgeType = User[.age]             // Int
+
+// keyof: field names as a type
+type UserField = keyof User           // .name | .age | .email | .active
+
+
+// ============================================
+// open records — functions over any record shape
+// ============================================
+
+// works on any record with at least a name field
+fn greet(r: { name: String, .. }) -> String {
+  "hello, {r.name}"
+}
+
+greet(user)                           // => "hello, ada"
+greet({ name: "bob" })                // => "hello, bob"
+greet({ name: "eve", role: "admin" }) // => "hello, eve"
+
+// generic get — works on any record, any field
+fn get(r: R, field: keyof R) -> R[field] = r[field]
+
+get(user, .name)                      // => "ada" : String
+get(user, .age)                       // => 36 : Int
+// get(user, .foo)                    // compile error: .foo not in keyof User
+
+// generic set — return the same record type with one field updated
+fn set(r: R, field: keyof R, value: R[field]) -> R {
+  r | { field: value }
+}
+
+set(user, .age, 37)                   // => { name: "ada", age: 37, ... }
+// set(user, .age, "old")             // compile error: String != Int
+
+
+// ============================================
+// mapped types
+// ============================================
+
+type Schema = { name: String, age: Int, email: String }
+
+// * applies a type function to every field
+type Form = Option * Schema
+// => { name: Option(String), age: Option(Int), email: Option(String) }
+
+type Pair(t) = (t, t)
+type Doubled = Pair * Schema
+// => { name: (String, String), age: (Int, Int), email: (String, String) }
+
+// comprehension: full control over mapping
+type Getters(r) = { k: () -> v for k: v in r }
+// Getters(Schema) => { name: () -> String, age: () -> Int, email: () -> String }
+
+type Setters(r) = { k: (v) -> r for k: v in r }
+// Setters(Schema) => { name: (String) -> Schema, age: (Int) -> Schema, ... }
+
+type Defaults(r) = { k: () -> v for k: v in r }
+// same shape as Getters — a thunk for each field's default value
+
+// comprehension with filter
+type StringFields(r) = { k: v for k: v in r if v is String }
+// StringFields(Schema) => { name: String, email: String }
+
+type NumericFields(r) = { k: v for k: v in r if v is Num }
+// NumericFields(Schema) => { age: Int }
+
+
+// ============================================
+// type-level pattern matching
+// ============================================
+
+type Unwrap(t) = match t {
+  Option(inner) => inner
+  _             => t
+}
+
+type A = Unwrap(Option(Int))          // Int
+type B = Unwrap(String)               // String
+
+// strip Option from every field — undo a Partial/Form
+type Required(r) = Unwrap * r
+// Required(Option * Schema) => Schema
+
+type Flatten(t) = match t {
+  Option(Option(inner)) => Option(inner)
+  List(List(inner))     => List(inner)
+  _                     => t
+}
+
+type DeepUnwrap(t) = match t {
+  Option(inner) => DeepUnwrap(inner)  // recursive!
+  _             => t
+}
+// DeepUnwrap(Option(Option(Option(Int)))) => Int
+
+// classify types
+type Classify(t) = match t {
+  Int   => .numeric
+  Float => .numeric
+  String => .text
+  Bool   => .flag
+  _      => .other
+}
+
+
+// ============================================
+// constraints — bounded polymorphism on records
+// ============================================
+
+// Show * R means "every field in R satisfies Show"
+fn show_record(r: R) -> String
+  where R : Show *
+{
+  r |> fold("{ ", fn(key, value, acc) {
+    acc ++ "{key}: {show(value)}, "
+  }) ++ "}"
+}
+
+show_record(user)
+// => "{ name: ada, age: 36, email: ada@example.com, active: true }"
+
+// Eq * R means "every field in R satisfies Eq"
+fn record_eq(a: R, b: R) -> Bool
+  where R : Eq *
+{
+  a |> fold(true, fn(key, val_a, acc) {
+    acc && eq(val_a, b[key])
+  })
+}
+
+// Num * R means "every field is numeric" — sum all fields
+fn sum_fields(r: R) -> Float
+  where R : Num *
+{
+  r |> fold(0.0, fn(_, value, acc) => acc + to_float(value))
+}
+
+type Stats = { mean: Float, stddev: Float, count: Int }
+sum_fields({ mean: 3.5, stddev: 1.2, count: 10 })  // => 14.7
+
+
+// ============================================
+// functors — modules parameterized by types
+// ============================================
+
+module Crud(S: { .. }) {
+  type Record = S
+  type Draft = Option * S
+
+  fn create(data: Record) -> Record = data
+
+  fn patch(original: Record, changes: Draft) -> Record {
+    original |> fold(original, fn(key, _, acc) {
+      match changes[key] {
+        Some(v) => acc | { key: v }
+        None    => acc
+      }
+    })
+  }
+
+  fn diff(a: Record, b: Record) -> Draft
+    where S : Eq *
+  {
+    a |> fold({} : Draft, fn(key, val_a, acc) {
+      if eq(val_a, b[key]) then acc | { key: None }
+      else acc | { key: Some(b[key]) }
+    })
+  }
+}
+
+module Users = Crud({ name: String, email: String, age: Int })
+
+let u = Users.create({ name: "ada", email: "ada@example.com", age: 36 })
+let u2 = Users.patch(u, { name: Some("Ada Lovelace"), email: None, age: None })
+
+
+// ============================================
+// validation
+// ============================================
+
+type Validator(t) = t -> Result(t, String)
+
+// Validator * R gives you a validator for each field
+type Validators(r) = Validator * r
+// Validators(Schema) => { name: Validator(String), age: Validator(Int), ... }
+
+let schema_validators: Validators(Schema) = {
+  name:  fn(s) => if length(s) > 0 then Ok(s) else Err("name required"),
+  age:   fn(n) => if n >= 0 && n < 150 then Ok(n) else Err("invalid age"),
+  email: fn(s) => if contains(s, "@") then Ok(s) else Err("invalid email"),
+}
+
+fn validate(data: R, validators: Validator * R) -> Result(R, List(String)) {
+  let errors = data |> fold([], fn(key, value, errs) {
+    match validators[key](value) {
+      Ok(_)  => errs
+      Err(e) => ["{key}: {e}", ...errs]
+    }
+  })
+  if is_empty(errors) then Ok(data) else Err(errors)
+}
+
+validate(
+  { name: "", age: -1, email: "bad" },
+  schema_validators
+)
+// => Err(["name: name required", "age: invalid age", "email: invalid email"])
+
+
+// ============================================
+// extensible variants
+// ============================================
+
+type Shape = [
+  | .circle: { radius: Float }
+  | .rect: { width: Float, height: Float }
+  | .tri: { base: Float, height: Float }
+]
+
+fn area(s: Shape) -> Float = match s {
+  .circle(c) => 3.14159 * c.radius ** 2.0
+  .rect(r)   => r.width * r.height
+  .tri(t)    => 0.5 * t.base * t.height
+}
+
+// extend with new cases — + on variants, just like + on records
+type Shape3D = Shape + [
+  | .sphere: { radius: Float }
+  | .cube: { side: Float }
+]
+
+fn volume(s: Shape3D) -> Float = match s {
+  .sphere(s) => (4.0 / 3.0) * 3.14159 * s.radius ** 3.0
+  .cube(c)   => c.side ** 3.0
+  other      => 0.0  // 2D shapes have no volume
+}
+
+// open variant function — handles any variant with at least .circle
+fn circumference(s: [ .circle: { radius: Float }, .. ]) -> Float {
+  match s {
+    .circle(c) => 2.0 * 3.14159 * c.radius
+  }
+}
+
+// works on Shape, Shape3D, or any future extension
+circumference(.circle({ radius: 5.0 }))  // => 31.4159
+
+
+// ============================================
+// record algebra identities
+// ============================================
+
+// these all hold:
+// (a + b) - keyof b  ==  a
+// a[keyof a]         ==  a
+// a + {}             ==  a
+// a - ()             ==  a
+// Option * (a + b)   ==  (Option * a) + (Option * b)   // map distributes over merge
+// (a | b)[.x]        ==  b[.x] if .x in keyof b, else a[.x]
+// keyof (a + b)      ==  keyof a | keyof b
+// keyof (a - .x)     ==  keyof a - .x
+
+
+// ============================================
+// real example: config system
+// ============================================
+
+type LogLevel = [| .debug | .info | .warn | .error]
+
+type ServerConfig = {
+  host: String,
+  port: Int,
+  log_level: LogLevel,
+  max_connections: Int,
+  timeout_ms: Int,
+}
+
+let defaults: ServerConfig = {
+  host: "localhost",
+  port: 8080,
+  log_level: .info,
+  max_connections: 100,
+  timeout_ms: 30000,
+}
+
+// override accepts any subset of ServerConfig fields
+fn configure(overrides: R) -> ServerConfig
+  where R : { .. } , keyof R : keyof ServerConfig
+{
+  defaults | overrides
+}
+
+let prod = configure({ host: "0.0.0.0", port: 443, log_level: .warn })
+// => { host: "0.0.0.0", port: 443, log_level: .warn,
+//      max_connections: 100, timeout_ms: 30000 }
+
+
+// ============================================
+// real example: form state machine
+// ============================================
+
+// track which fields have been filled via the type
+type FormState(total, filled) = {
+  data: filled,
+  remaining: keyof (total - keyof filled),
+}
+
+fn empty_form() -> FormState(S, {}) {
+  { data: {}, remaining: keyof S }
+}
+
+fn fill(form: FormState(S, F), field: keyof (S - keyof F), value: S[field])
+  -> FormState(S, F + { field: S[field] })
+{
+  { data: form.data + { field: value },
+    remaining: form.remaining - field }
+}
+
+fn submit(form: FormState(S, S)) -> S {
+  // can only call when filled == total — all fields present
+  form.data
+}
+
+let f = empty_form()                   // FormState(Schema, {})
+let f = fill(f, .name, "ada")         // FormState(Schema, { name: String })
+let f = fill(f, .age, 36)             // FormState(Schema, { name: String, age: Int })
+let f = fill(f, .email, "ada@ex.com") // FormState(Schema, Schema)
+let result = submit(f)                 // Schema — only compiles when all fields filled
+// submit(fill(empty_form(), .name, "ada"))  // compile error: missing .age, .email
+
+
+// ============================================
+// real example: type-safe lenses
+// ============================================
+
+type Lens(s, a) = {
+  get: s -> a,
+  set: (s, a) -> s,
+}
+
+// auto-generate a lens for any field of any record
+fn lens(field: keyof R) -> Lens(R, R[field]) {
+  {
+    get: fn(r) => r[field],
+    set: fn(r, v) => r | { field: v },
+  }
+}
+
+let name_lens = lens(.name)  // Lens({ name: String, .. }, String)
+
+name_lens.get(user)                    // => "ada"
+name_lens.set(user, "Ada Lovelace")    // => { name: "Ada Lovelace", age: 36, ... }
+
+// compose lenses
+fn compose_lens(outer: Lens(s, a), inner: Lens(a, b)) -> Lens(s, b) {
+  {
+    get: fn(s) => inner.get(outer.get(s)),
+    set: fn(s, b) => outer.set(s, inner.set(outer.get(s), b)),
+  }
+}
+
+type Company = { name: String, ceo: User }
+
+let ceo_name = compose_lens(lens(.ceo), lens(.name))
+// Lens(Company, String)
+
+ceo_name.get({ name: "Acme", ceo: user })  // => "ada"
+
+
+// ============================================
+// real example: serialization
+// ============================================
+
+type ToJson(t) = t -> Json
+
+// if every field in R has a ToJson instance, we can serialize the whole record
+fn record_to_json(r: R) -> Json
+  where R : ToJson *
+{
+  r |> fold(json_object([]), fn(key, value, acc) {
+    json_set(acc, to_string(key), to_json(value))
+  })
+}
+
+// build a codec pair for any record type
+type Codec(t) = { encode: t -> Json, decode: Json -> Result(t, String) }
+
+fn record_codec() -> Codec(R)
+  where R : Codec *
+{
+  {
+    encode: fn(r) => record_to_json(r),
+    decode: fn(j) => {
+      j |> fold(Ok({} : R), fn(key, _, acc) {
+        match acc {
+          Err(e) => Err(e)
+          Ok(partial) => match decode(json_get(j, to_string(key))) {
+            Err(e) => Err("{key}: {e}")
+            Ok(v)  => Ok(partial | { key: v })
+          }
+        }
+      })
+    }
+  }
+}
