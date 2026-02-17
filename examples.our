@@ -431,3 +431,222 @@ fn record_codec() -> Codec(R)
     }
   }
 }
+
+
+// ============================================
+// monads + do-notation
+// ============================================
+
+class Functor(f) {
+  fn map(x: f(a), transform: a -> b) -> f(b)
+}
+
+class Monad(m) : Functor(m) {
+  fn pure(value: a) -> m(a)
+  fn bind(x: m(a), then: a -> m(b)) -> m(b)
+}
+
+instance Monad(Option) {
+  fn pure(v) = Some(v)
+  fn bind(x, then) = match x {
+    Some(v) => then(v)
+    None    => None
+  }
+}
+
+instance Monad(Result(e)) {
+  fn pure(v) = Ok(v)
+  fn bind(x, then) = match x {
+    Ok(v)  => then(v)
+    Err(e) => Err(e)
+  }
+}
+
+instance Monad(List) {
+  fn pure(v) = [v]
+  fn bind(xs, then) = xs |> flat_map(then)
+}
+
+// do { x <- expr; ... } desugars to bind(expr, fn(x) => ...)
+
+fn find_user_email(id: Int) -> Option(String) = do {
+  user <- lookup_user(id)
+  profile <- user.profile
+  pure(profile.email)
+}
+
+// desugars to:
+// bind(lookup_user(id), fn(user) =>
+//   bind(user.profile, fn(profile) =>
+//     pure(profile.email)))
+
+fn safe_divide(a: Float, b: Float) -> Option(Float) = do {
+  _ <- if b == 0.0 then None else Some(())
+  pure(a / b)
+}
+
+fn parse_config(raw: String) -> Result(Config, String) = do {
+  json <- parse_json(raw)
+  host <- json |> get_string("host")
+  port <- json |> get_int("port")
+  pure({ host, port })
+}
+
+// list monad — nondeterminism
+let pairs = do {
+  x <- [1, 2, 3]
+  y <- [10, 20]
+  pure(x + y)
+}
+// => [11, 21, 12, 22, 13, 23]
+
+// let bindings inside do (no bind, just a regular let)
+fn lookup_full_name(id: Int) -> Option(String) = do {
+  user <- lookup_user(id)
+  let first = user.first_name
+  let last = user.last_name
+  pure("{first} {last}")
+}
+
+// state monad
+type State(s, a) = s -> (a, s)
+
+fn counter() -> State(Int, List(Int)) = do {
+  a <- get()
+  _ <- modify(fn(n) => n + 1)
+  b <- get()
+  _ <- modify(fn(n) => n + 10)
+  c <- get()
+  pure([a, b, c])
+}
+
+counter()(0)  // => ([0, 1, 11], 11)
+
+
+// ============================================
+// effects — typed errors + dependencies
+// ============================================
+
+// Effect(value, error, requirements)
+//   row types do ALL the work:
+//   - record + merges requirements
+//   - variant + merges errors
+
+type Effect(a, e, r)
+
+instance Monad(Effect(e, r)) {
+  fn pure(v) = Effect.succeed(v)
+  fn bind(x, then) = Effect.flatMap(x, then)
+}
+
+// errors as extensible variants
+type DbError   = [| .not_found: { id: Int } | .connection_failed: String]
+type AuthError  = [| .unauthorized | .expired: { token: String }]
+type SmtpError  = [| .invalid_address: String | .send_failed: String]
+
+// services as record types
+type Database   = { query: (String) -> Effect(List(Row), DbError, {}),
+                    find:  (Int) -> Effect(Row, DbError, {}) }
+
+type AuthService = { verify: (String) -> Effect(UserId, AuthError, {}) }
+type SmtpClient  = { send: (String, String) -> Effect(Unit, SmtpError, {}) }
+
+// effects declare what they need and how they fail
+fn get_user(id: Int) -> Effect(User, DbError, { db: Database }) = do {
+  row <- Effect.service(.db) |> .find(id)
+  pure(user_from_row(row))
+}
+
+fn verify_token(tok: String) -> Effect(UserId, AuthError, { auth: AuthService }) = do {
+  uid <- Effect.service(.auth) |> .verify(tok)
+  pure(uid)
+}
+
+fn send_welcome(email: String) -> Effect(Unit, SmtpError, { smtp: SmtpClient }) = do {
+  _ <- Effect.service(.smtp) |> .send(email, "welcome!")
+  pure(())
+}
+
+// composing effects merges requirements AND errors
+fn register(token: String, data: SignupData)
+  -> Effect(User, DbError | AuthError | SmtpError,
+            { db: Database, auth: AuthService, smtp: SmtpClient })
+= do {
+  uid   <- verify_token(token)        // needs { auth }
+  user  <- get_user(uid)              // needs { db }
+  _     <- send_welcome(user.email)   // needs { smtp }
+  pure(user)                          // merged: { db, auth, smtp }
+}
+
+
+// ============================================
+// layers — dependency injection
+// ============================================
+
+type Layer(out, e, inp)
+
+type Config = { db_url: String, smtp_host: String, auth_secret: String }
+
+let db_layer: Layer({ db: Database }, DbError, { config: Config }) =
+  Layer.from(fn(env) => do {
+    conn <- connect(env.config.db_url)
+    pure({ db: make_database(conn) })
+  })
+
+let auth_layer: Layer({ auth: AuthService }, Never, { config: Config }) =
+  Layer.from(fn(env) =>
+    pure({ auth: make_auth(env.config.auth_secret) }))
+
+let smtp_layer: Layer({ smtp: SmtpClient }, SmtpError, { config: Config }) =
+  Layer.from(fn(env) => do {
+    client <- connect_smtp(env.config.smtp_host)
+    pure({ smtp: client })
+  })
+
+// merge layers — outputs merge, requirements unify
+let app_layer = db_layer + auth_layer + smtp_layer
+// Layer({ db: Database, auth: AuthService, smtp: SmtpClient },
+//       DbError | SmtpError,
+//       { config: Config })
+
+// provide eliminates requirements from an effect
+let runnable = register(token, data) |> Effect.provide(app_layer)
+// Effect(User, DbError | AuthError | SmtpError, { config: Config })
+
+let program = runnable |> Effect.provide(Layer.value({ config: prod_config }))
+// Effect(User, DbError | AuthError | SmtpError, {})
+//                                                ^^ no requirements left
+
+let result = Effect.run(program)
+// Result(User, DbError | AuthError | SmtpError)
+
+
+// ============================================
+// effect error handling
+// ============================================
+
+// catch specific variants — removes them from error channel
+let safe = register(token, data)
+  |> Effect.catch(.unauthorized, .expired)
+// Effect(Result(User, AuthError), DbError | SmtpError, { ... })
+
+// retry on specific failure
+let resilient = get_user(id)
+  |> Effect.retry({ times: 3, delay_ms: 100, on: .connection_failed })
+
+// fallback
+fn get_user_cached(id: Int) -> Effect(User, DbError, { db: Database, cache: Cache }) =
+  get_from_cache(id) |> Effect.or_else(fn(_) => get_user(id))
+
+// resource safety — scoped acquire/release
+fn with_connection(url: String) -> Effect(Connection, DbError, {}) =
+  Effect.acquire_release(
+    acquire: fn() => connect(url),
+    release: fn(conn) => close(conn),
+  )
+
+fn transact(id: Int) -> Effect(User, DbError, { config: Config }) = do {
+  conn <- with_connection(config.db_url)
+  row  <- conn |> .find(id)
+  pure(user_from_row(row))
+}
